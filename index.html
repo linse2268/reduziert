@@ -1,0 +1,472 @@
+<!DOCTYPE html>
+<html lang="de">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Videoanalyse</title>
+<style>
+body { font-family: sans-serif; background:#111; color:#fff; padding:20px; }
+button { padding:10px 16px; margin-right:8px; font-size:15px; }
+button:disabled { opacity:0.4; }
+#status { margin:14px 0; color:#aaa; }
+.output div { margin-bottom:6px; font-size:16px; }
+video { display:none; }
+</style>
+</head>
+<body>
+
+<input type="file" id="fileInput" accept="video/*">
+<button id="analyzeBtn" disabled>Analyse starten</button>
+
+<div id="status"></div>
+
+<div class="output">
+  <div>Farbkontrast (roh): <span id="colorContrastOut">–</span></div>
+  <div>Bewegung (roh): <span id="motionOut">–</span></div>
+  <div>Zeit pro Schnitt: <span id="cutTimeOut">–</span></div>
+</div>
+
+<video id="video" playsinline preload="metadata"></video>
+
+<script>
+"use strict";
+
+const fileInput = document.getElementById("fileInput");
+const video = document.getElementById("video");
+const analyzeBtn = document.getElementById("analyzeBtn");
+const statusEl = document.getElementById("status");
+const colorContrastOut = document.getElementById("colorContrastOut");
+const motionOut = document.getElementById("motionOut");
+const cutTimeOut = document.getElementById("cutTimeOut");
+
+const ANALYSIS_WIDTH = 160;
+const ANALYSIS_HEIGHT = 90;
+const SAMPLE_FPS = 10;
+const CONTRAST_GRID_COLS = 16;
+const CONTRAST_GRID_ROWS = 9;
+const NUM_BLOCKS = CONTRAST_GRID_COLS * CONTRAST_GRID_ROWS;
+
+const MOTION_MIN_DELTA_TIME = 1 / 120;
+const SEEK_TIMEOUT_MS = 3000;
+const STUCK_SAMPLES_LIMIT = 2;
+const BLANK_LUMINANCE_THRESHOLD = 10;
+const BLANK_DIFF_THRESHOLD = 2;
+const BLANK_STREAK_LIMIT = 50;
+const CUT_THRESHOLD = 36;
+const CUT_MIN_DISTANCE = 0.35;
+
+const analysisCanvas = document.createElement("canvas");
+analysisCanvas.width = ANALYSIS_WIDTH;
+analysisCanvas.height = ANALYSIS_HEIGHT;
+const analysisCtx = analysisCanvas.getContext("2d", { willReadFrequently: true });
+
+let videoURL = null;
+let results = [];
+let isAnalyzing = false;
+let previousFrame = null;
+let nextBufferIndex = 0;
+
+const FRAME_BUFFER_SIZE = ANALYSIS_WIDTH * ANALYSIS_HEIGHT * 4;
+const frameBuffers = [
+  new Uint8ClampedArray(FRAME_BUFFER_SIZE),
+  new Uint8ClampedArray(FRAME_BUFFER_SIZE)
+];
+
+const blockSumR = new Float64Array(NUM_BLOCKS);
+const blockSumG = new Float64Array(NUM_BLOCKS);
+const blockSumB = new Float64Array(NUM_BLOCKS);
+const blockCount = new Int32Array(NUM_BLOCKS);
+const blockMeanR = new Float64Array(NUM_BLOCKS);
+const blockMeanG = new Float64Array(NUM_BLOCKS);
+const blockMeanB = new Float64Array(NUM_BLOCKS);
+const blockLabL = new Float64Array(NUM_BLOCKS);
+const blockLabA = new Float64Array(NUM_BLOCKS);
+const blockLabB = new Float64Array(NUM_BLOCKS);
+
+fileInput.addEventListener("change", () => {
+  const file = fileInput.files[0];
+  if (!file) return;
+
+  if (file.type && !file.type.startsWith("video/")) {
+    statusEl.textContent = "Bitte eine Videodatei auswählen.";
+    fileInput.value = "";
+    return;
+  }
+
+  if (videoURL) URL.revokeObjectURL(videoURL);
+  videoURL = URL.createObjectURL(file);
+  video.src = videoURL;
+
+  analyzeBtn.disabled = false;
+  statusEl.textContent = "";
+
+  colorContrastOut.textContent = "–";
+  motionOut.textContent = "–";
+  cutTimeOut.textContent = "–";
+
+  results = [];
+  previousFrame = null;
+  nextBufferIndex = 0;
+});
+
+analyzeBtn.addEventListener("click", async () => {
+  if (isAnalyzing) return;
+
+  if (!video.duration || !isFinite(video.duration)) {
+    statusEl.textContent = "Video konnte noch nicht geladen werden.";
+    return;
+  }
+
+  isAnalyzing = true;
+  analyzeBtn.disabled = true;
+  fileInput.disabled = true;
+
+  results = [];
+  previousFrame = null;
+  nextBufferIndex = 0;
+
+  colorContrastOut.textContent = "–";
+  motionOut.textContent = "–";
+  cutTimeOut.textContent = "–";
+
+  statusEl.textContent = "Analysiere …";
+
+  try {
+    await analyzeVideo();
+    finishAnalysis();
+  } catch (error) {
+    console.error(error);
+    statusEl.textContent = "Fehler bei der Analyse.";
+  } finally {
+    isAnalyzing = false;
+    analyzeBtn.disabled = false;
+    fileInput.disabled = false;
+  }
+});
+
+function getEffectiveDuration() {
+  let effectiveDuration = video.duration;
+  try {
+    if (video.seekable && video.seekable.length > 0) {
+      const seekableEnd = video.seekable.end(video.seekable.length - 1);
+      if (isFinite(seekableEnd) && seekableEnd > 0 && seekableEnd < effectiveDuration) {
+        effectiveDuration = seekableEnd;
+      }
+    }
+  } catch (error) {}
+  return effectiveDuration;
+}
+
+async function analyzeVideo() {
+  const duration = getEffectiveDuration();
+  const totalSamples = Math.max(1, Math.ceil(duration * SAMPLE_FPS));
+
+  let lastActualTime = -1;
+  let stuckCount = 0;
+  let blankStreak = 0;
+
+  for (let i = 0; i < totalSamples; i++) {
+    const targetTime = i / SAMPLE_FPS;
+    if (targetTime >= duration) break;
+
+    await seekVideo(targetTime);
+
+    const time = video.currentTime;
+
+    if (time <= lastActualTime + 0.001) {
+      stuckCount++;
+      if (stuckCount >= STUCK_SAMPLES_LIMIT) break;
+    } else {
+      stuckCount = 0;
+    }
+    lastActualTime = time;
+
+    drawVideoFrameForAnalysis();
+
+    const imageData = analysisCtx.getImageData(0, 0, ANALYSIS_WIDTH, ANALYSIS_HEIGHT);
+
+    const previousSampleTime = results.length > 0 ? results[results.length - 1].time : null;
+    const deltaTime = previousSampleTime === null ? null : time - previousSampleTime;
+
+    const frame = analyzeFrame(imageData.data, previousFrame, deltaTime);
+
+    results.push({
+      time,
+      colorContrastRaw: frame.colorContrastRaw,
+      motionRaw: frame.motionRaw,
+      cutDiffRaw: frame.cutDiffRaw
+    });
+
+    const isBlankFrame =
+      previousFrame !== null &&
+      frame.meanLuminance < BLANK_LUMINANCE_THRESHOLD &&
+      frame.pixelDiff < BLANK_DIFF_THRESHOLD;
+
+    blankStreak = isBlankFrame ? blankStreak + 1 : 0;
+
+    const buffer = frameBuffers[nextBufferIndex];
+    buffer.set(imageData.data);
+    previousFrame = buffer;
+    nextBufferIndex = 1 - nextBufferIndex;
+
+    if (blankStreak >= BLANK_STREAK_LIMIT) {
+      results.splice(results.length - blankStreak, blankStreak);
+      break;
+    }
+
+    const progress = Math.min(100, ((i + 1) / totalSamples) * 100);
+    statusEl.textContent = `Analysiere ${Math.round(progress)} %`;
+
+    if (i % 4 === 0) await nextFrame();
+  }
+
+  statusEl.textContent = "Fertig.";
+}
+
+function drawVideoFrameForAnalysis() {
+  const videoWidth = video.videoWidth || ANALYSIS_WIDTH;
+  const videoHeight = video.videoHeight || ANALYSIS_HEIGHT;
+  const canvasAspect = ANALYSIS_WIDTH / ANALYSIS_HEIGHT;
+  const videoAspect = videoWidth / videoHeight;
+
+  let drawWidth, drawHeight;
+  if (videoAspect > canvasAspect) {
+    drawWidth = ANALYSIS_WIDTH;
+    drawHeight = ANALYSIS_WIDTH / videoAspect;
+  } else {
+    drawHeight = ANALYSIS_HEIGHT;
+    drawWidth = ANALYSIS_HEIGHT * videoAspect;
+  }
+
+  const offsetX = (ANALYSIS_WIDTH - drawWidth) / 2;
+  const offsetY = (ANALYSIS_HEIGHT - drawHeight) / 2;
+
+  analysisCtx.fillStyle = "#000";
+  analysisCtx.fillRect(0, 0, ANALYSIS_WIDTH, ANALYSIS_HEIGHT);
+  analysisCtx.drawImage(video, offsetX, offsetY, drawWidth, drawHeight);
+}
+
+function seekVideo(time, timeoutMs = SEEK_TIMEOUT_MS) {
+  return new Promise((resolve, reject) => {
+    let settled = false;
+
+    const onSeeked = () => {
+      if (settled) return;
+      settled = true;
+      cleanup();
+      resolve();
+    };
+
+    const onError = () => {
+      if (settled) return;
+      settled = true;
+      cleanup();
+      reject(new Error("Video konnte nicht gelesen werden."));
+    };
+
+    const timeoutId = setTimeout(() => {
+      if (settled) return;
+      settled = true;
+      cleanup();
+      reject(new Error("Zeitüberschreitung beim Springen im Video."));
+    }, timeoutMs);
+
+    function cleanup() {
+      clearTimeout(timeoutId);
+      video.removeEventListener("seeked", onSeeked);
+      video.removeEventListener("error", onError);
+    }
+
+    video.addEventListener("seeked", onSeeked, { once: true });
+    video.addEventListener("error", onError, { once: true });
+    video.currentTime = time;
+  });
+}
+
+function srgbChannelToLinear(value) {
+  const normalized = value / 255;
+  return normalized <= 0.04045 ? normalized / 12.92 : Math.pow((normalized + 0.055) / 1.055, 2.4);
+}
+
+const LAB_EPSILON = 216 / 24389;
+const LAB_KAPPA = 24389 / 27;
+
+function labF(t) {
+  return t > LAB_EPSILON ? Math.cbrt(t) : (LAB_KAPPA * t + 16) / 116;
+}
+
+const LAB_WHITE_X = 0.95047;
+const LAB_WHITE_Y = 1;
+const LAB_WHITE_Z = 1.08883;
+
+function rgbToLab(r, g, b) {
+  const linearR = srgbChannelToLinear(r);
+  const linearG = srgbChannelToLinear(g);
+  const linearB = srgbChannelToLinear(b);
+
+  const x = linearR * 0.4124564 + linearG * 0.3575761 + linearB * 0.1804375;
+  const y = linearR * 0.2126729 + linearG * 0.7151522 + linearB * 0.0721750;
+  const z = linearR * 0.0193339 + linearG * 0.1191920 + linearB * 0.9503041;
+
+  const fx = labF(x / LAB_WHITE_X);
+  const fy = labF(y / LAB_WHITE_Y);
+  const fz = labF(z / LAB_WHITE_Z);
+
+  return { l: 116 * fy - 16, a: 500 * (fx - fy), b: 200 * (fy - fz) };
+}
+
+function averagePairwiseDeltaEDistance(lValues, aValues, bValues, count) {
+  if (count < 2) return 0;
+
+  let sum = 0;
+  let pairs = 0;
+
+  for (let i = 0; i < count; i++) {
+    const lI = lValues[i], aI = aValues[i], bI = bValues[i];
+    for (let j = i + 1; j < count; j++) {
+      const dL = lI - lValues[j];
+      const dA = aI - aValues[j];
+      const dB = bI - bValues[j];
+      sum += Math.sqrt(dL * dL + dA * dA + dB * dB);
+      pairs++;
+    }
+  }
+
+  return pairs > 0 ? sum / pairs : 0;
+}
+
+function analyzeFrame(data, previousData, deltaTime) {
+  const hasPrevious = !!previousData;
+  const blockWidth = ANALYSIS_WIDTH / CONTRAST_GRID_COLS;
+  const blockHeight = ANALYSIS_HEIGHT / CONTRAST_GRID_ROWS;
+
+  blockSumR.fill(0);
+  blockSumG.fill(0);
+  blockSumB.fill(0);
+  blockCount.fill(0);
+
+  let lumSum = 0;
+  let cutDiffSum = 0;
+  let count = 0;
+
+  for (let i = 0; i < data.length; i += 4) {
+    const r = data[i], g = data[i + 1], b = data[i + 2];
+
+    const luminance = 0.2126 * r + 0.7152 * g + 0.0722 * b;
+    lumSum += luminance;
+    count++;
+
+    const pixelIndex = i / 4;
+    const x = pixelIndex % ANALYSIS_WIDTH;
+    const y = Math.floor(pixelIndex / ANALYSIS_WIDTH);
+    const blockCol = Math.min(CONTRAST_GRID_COLS - 1, Math.floor(x / blockWidth));
+    const blockRow = Math.min(CONTRAST_GRID_ROWS - 1, Math.floor(y / blockHeight));
+    const blockIndex = blockRow * CONTRAST_GRID_COLS + blockCol;
+
+    blockSumR[blockIndex] += r;
+    blockSumG[blockIndex] += g;
+    blockSumB[blockIndex] += b;
+    blockCount[blockIndex]++;
+
+    if (hasPrevious) {
+      const pr = previousData[i], pg = previousData[i + 1], pb = previousData[i + 2];
+      cutDiffSum += (Math.abs(r - pr) + Math.abs(g - pg) + Math.abs(b - pb)) / 3;
+    }
+  }
+
+  const mean = lumSum / count;
+
+  for (let blockIndex = 0; blockIndex < NUM_BLOCKS; blockIndex++) {
+    const pixelsInBlock = blockCount[blockIndex] || 1;
+    blockMeanR[blockIndex] = blockSumR[blockIndex] / pixelsInBlock;
+    blockMeanG[blockIndex] = blockSumG[blockIndex] / pixelsInBlock;
+    blockMeanB[blockIndex] = blockSumB[blockIndex] / pixelsInBlock;
+
+    const lab = rgbToLab(blockMeanR[blockIndex], blockMeanG[blockIndex], blockMeanB[blockIndex]);
+    blockLabL[blockIndex] = lab.l;
+    blockLabA[blockIndex] = lab.a;
+    blockLabB[blockIndex] = lab.b;
+  }
+
+  const colorContrastRaw = averagePairwiseDeltaEDistance(blockLabL, blockLabA, blockLabB, NUM_BLOCKS);
+
+  if (!hasPrevious) {
+    return { colorContrastRaw, motionRaw: 0, cutDiffRaw: 0, meanLuminance: mean, pixelDiff: 0 };
+  }
+
+  const averageCutDifference = cutDiffSum / count;
+  const safeDeltaTime = Math.max(deltaTime || 0, MOTION_MIN_DELTA_TIME);
+  const motionRaw = averageCutDifference / safeDeltaTime;
+
+  return {
+    colorContrastRaw,
+    motionRaw,
+    cutDiffRaw: averageCutDifference,
+    meanLuminance: mean,
+    pixelDiff: averageCutDifference
+  };
+}
+
+function detectCuts(data) {
+  const cuts = [];
+  let lastCutTime = -Infinity;
+
+  for (let i = 1; i < data.length - 1; i++) {
+    const current = data[i], previous = data[i - 1], next = data[i + 1];
+
+    const isPeak = current.cutDiffRaw >= previous.cutDiffRaw && current.cutDiffRaw >= next.cutDiffRaw;
+
+    if (isPeak && current.cutDiffRaw >= CUT_THRESHOLD && current.time - lastCutTime >= CUT_MIN_DISTANCE) {
+      cuts.push({ time: current.time, diffRaw: current.cutDiffRaw });
+      lastCutTime = current.time;
+    }
+  }
+
+  return cuts;
+}
+
+function finishAnalysis() {
+  if (!results.length) {
+    statusEl.textContent = "Keine Ergebnisse.";
+    return;
+  }
+
+  const avgColorContrastRaw = average(results.map(r => r.colorContrastRaw));
+  const avgMotionRaw = average(results.map(r => r.motionRaw));
+
+  const cuts = detectCuts(results);
+  const videoDurationSeconds = results[results.length - 1].time;
+  const zeitProSchnittSeconds = cuts.length > 0 ? videoDurationSeconds / cuts.length : NaN;
+
+  colorContrastOut.textContent = formatDecimal(avgColorContrastRaw);
+  motionOut.textContent = formatDecimal(avgMotionRaw);
+  cutTimeOut.textContent = isFinite(zeitProSchnittSeconds)
+    ? `${formatDecimal(zeitProSchnittSeconds)} s`
+    : "–";
+
+  statusEl.textContent = "Fertig.";
+}
+
+function average(values) {
+  if (!values.length) return 0;
+  return values.reduce((sum, value) => sum + value, 0) / values.length;
+}
+
+function formatDecimal(value, digits = 1) {
+  if (typeof value !== "number" || !isFinite(value)) return "–";
+  return value.toFixed(digits).replace(".", ",");
+}
+
+function nextFrame() {
+  return new Promise(resolve => {
+    if ("requestIdleCallback" in window) {
+      requestIdleCallback(() => resolve(), { timeout: 50 });
+    } else {
+      setTimeout(resolve, 0);
+    }
+  });
+}
+</script>
+
+</body>
+</html>
