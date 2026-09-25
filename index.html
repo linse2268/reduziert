@@ -441,7 +441,7 @@ function finishAnalysis() {
   colorContrastOut.textContent = formatDecimal(avgColorContrastRaw, 2);
   motionOut.textContent = formatDecimal(avgMotionRaw, 2);
   cutTimeOut.textContent = isFinite(zeitProSchnittSeconds)
-    ? `${formatDecimal(zeitProSchnittSeconds)} s`
+    ? `${formatDecimal(zeitProSchnittSeconds, 2)} s`
     : "–";
 
   statusEl.textContent = "Fertig.";
