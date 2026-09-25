@@ -438,8 +438,8 @@ function finishAnalysis() {
   const videoDurationSeconds = results[results.length - 1].time;
   const zeitProSchnittSeconds = cuts.length > 0 ? videoDurationSeconds / cuts.length : NaN;
 
-  colorContrastOut.textContent = formatDecimal(avgColorContrastRaw);
-  motionOut.textContent = formatDecimal(avgMotionRaw);
+  colorContrastOut.textContent = formatDecimal(avgColorContrastRaw, 2);
+  motionOut.textContent = formatDecimal(avgMotionRaw, 2);
   cutTimeOut.textContent = isFinite(zeitProSchnittSeconds)
     ? `${formatDecimal(zeitProSchnittSeconds)} s`
     : "–";
